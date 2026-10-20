@@ -1,0 +1,24 @@
+{
+  "name": "youtube-to-course",
+  "owner": {
+    "name": "tstfully",
+    "url": "https://github.com/tstfully"
+  },
+  "description": "🎓 Turn any YouTube video into an interactive course with quizzes, flashcards, and progress tracking.",
+  "plugins": [
+    {
+      "name": "youtube-to-course",
+      "source": ".",
+      "description": "🎓 Turn any YouTube video into an interactive course with quizzes, flashcards, and progress tracking.",
+      "category": "productivity",
+      "tags": [
+        "course",
+        "education",
+        "quiz",
+        "flashcards",
+        "study",
+        "youtube"
+      ]
+    }
+  ]
+}
