@@ -1,0 +1,131 @@
+name: abac
+
+services:
+  neo4j:
+    image: neo4j:5.26.8
+    hostname: neo4j
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      NEO4J_AUTH: neo4j/abac-local
+      NEO4J_server_memory_heap_initial__size: 256m
+      NEO4J_server_memory_heap_max__size: 512m
+      NEO4J_server_memory_pagecache_size: 128m
+    volumes:
+      - neo4j-data:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -a bolt://localhost:7687 -u neo4j -p abac-local 'RETURN 1'"]
+      interval: 5s
+      timeout: 10s
+      retries: 40
+      start_period: 25s
+
+  neo4j-init:
+    image: neo4j:5.26.8
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    volumes:
+      - ./neo4j/init.cypher:/init/init.cypher:ro
+    entrypoint:
+      - cypher-shell
+      - -a
+      - bolt://neo4j:7687
+      - -u
+      - neo4j
+      - -p
+      - abac-local
+      - -f
+      - /init/init.cypher
+    restart: "no"
+
+  opa:
+    image: openpolicyagent/opa:1.4.2
+    command:
+      - run
+      - --server
+      - --addr=0.0.0.0:8181
+      - --log-level=info
+      - /policies/kafka.authz.rego
+    volumes:
+      - ./policies/kafka.authz.rego:/policies/kafka.authz.rego:ro
+
+  sync:
+    build: ./sync
+    depends_on:
+      neo4j-init:
+        condition: service_completed_successfully
+      opa:
+        condition: service_started
+    environment:
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: abac-local
+      OPA_URL: http://opa:8181/v1/data
+      TOPIC_QUERY_PATH: /cypher/export-topics.cypher
+      PRINCIPAL_QUERY_PATH: /cypher/export-principals.cypher
+      SYNC_INTERVAL_SECONDS: "15"
+    volumes:
+      - ./neo4j/export-topics.cypher:/cypher/export-topics.cypher:ro
+      - ./neo4j/export-principals.cypher:/cypher/export-principals.cypher:ro
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import pathlib,sys; sys.exit(0 if pathlib.Path('/tmp/sync-ready').exists() else 1)
+      interval: 5s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
+
+  kafka:
+    build: ./kafka
+    hostname: kafka
+    depends_on:
+      sync:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "4L6g3nShT-eMCtK--X86sw"
+      KAFKA_HEAP_OPTS: "-Xmx512M -Xms256M"
+      KAFKA_LOG4J_LOGGERS: org.openpolicyagent=INFO
+    volumes:
+      - ./kafka/server.properties:/mnt/shared/config/server.properties:ro
+      - ./kafka/client-kafka.properties:/mnt/shared/config/client-kafka.properties:ro
+      - ./kafka/client-pii-consumer.properties:/mnt/shared/config/client-pii-consumer.properties:ro
+      - ./kafka/client-analyst.properties:/mnt/shared/config/client-analyst.properties:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - /opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 --command-config /mnt/shared/config/client-kafka.properties
+      interval: 10s
+      timeout: 20s
+      retries: 20
+      start_period: 20s
+
+  flink:
+    build: ./flink
+    depends_on:
+      kafka:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx512m"
+      KAFKA_BOOTSTRAP: kafka:9092
+      SOURCE_TOPIC: credit-scores
+      SINK_TOPIC: credit-scores-sanitized
+      MASK_PRINCIPAL: analyst
+      KAFKA_SASL_USERNAME: pii_consumer
+      KAFKA_SASL_PASSWORD: pii-secret
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: abac-local
+      CACHE_REFRESH_SECONDS: "30"
+      FLINK_REST_PORT: "18081"
+
+volumes:
+  neo4j-data:
