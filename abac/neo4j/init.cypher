@@ -11,6 +11,9 @@ SET t.region = "us", t.classification = 3;
 MERGE (t:Topic {name: "orders"})
 SET t.region = "eu", t.classification = 1;
 
+MERGE (t:Topic {name: "credit-scores-sanitized"})
+SET t.region = "us", t.classification = 1;
+
 MERGE (f:Field {name: "ssn"})
 SET f.sensitivity = "high";
 

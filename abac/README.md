@@ -27,16 +27,16 @@ Neo4j auth is `neo4j` / `abac-local`.
 - `neo4j/init.cypher` loads topics, fields, tags, and both principals on startup
 - `neo4j/export-topics.cypher` is the topic-metadata query
 - `neo4j/export-principals.cypher` exports every principal, including `analyst`
-- `policies/kafka.authz.rego` is package `kafka.authz` (default deny, then allow when the PII read rule does not match)
+- `policies/kafka.authz.rego` is package `kafka.authz`. Topic reads are denied unless the topic, principal, and a numeric clearance are all present, and still denied for PII when clearance is below classification. WRITE stays allowed
 - `sync/sync.py` runs those queries and `PUT`s `/v1/data`
-- `flink/` masks `ssn` when the audience clearance is below 3
+- `flink/` masks high-sensitivity and unknown fields when the audience clearance is below 3. An empty field snapshot masks every field
 
 ## Bring-up order
 
 Compose starts the services in this order:
 
 1. **Graph.** Neo4j becomes healthy, then `neo4j-init` loads `init.cypher`.
-2. **Rego.** OPA serves `policies/kafka.authz.rego`.
+2. **Rego.** OPA serves `policies/kafka.authz.rego` on the compose network only. The plugin cannot send a bearer token, so port 8181 is not published to the host.
 3. **Sync.** The sync job publishes `topics` and `principals` before it is marked healthy. Kafka waits for that.
 4. **Plugin.** The Kafka image puts `opa-authorizer-1.5.1.jar` (plus Guava, which that jar does not embed) on the classpath from `/usr/local/share/kafka/plugins/` and sets `authorizer.class.name=org.openpolicyagent.kafka.OpaAuthorizer`.
 5. **Flink.** The mask job starts after the broker is healthy. It reads `credit-scores` as `pii_consumer` and writes `credit-scores-sanitized` for `analyst`.
@@ -103,19 +103,18 @@ docker compose exec -T kafka \
   --consumer.config /mnt/shared/config/client-analyst.properties
 ```
 
-`analyst` (clearance 1) is denied on `credit-scores` because the topic is tagged `pii` and clearance is below the topic classification. The same read against OPA:
+`analyst` (clearance 1) is denied on `credit-scores` because the topic is tagged `pii` and clearance is below the topic classification. A topic read is also denied when the topic or principal is missing from the projection. The same read against OPA, from the compose network:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8181/v1/data/kafka/authz/allow \
-  -H 'content-type: application/json' \
-  -d '{"input":{"action":{"operation":"READ","resourcePattern":{"name":"credit-scores","resourceType":"TOPIC","patternType":"LITERAL"}},"requestContext":{"principal":{"name":"analyst","principalType":"User"}}}}'
+docker compose exec -T -e OPA_PRINCIPAL=analyst -e OPA_TOPIC=credit-scores sync \
+  python -c 'import json,os,urllib.request; payload={"input":{"action":{"operation":"READ","resourcePattern":{"name":os.environ["OPA_TOPIC"],"resourceType":"TOPIC","patternType":"LITERAL"}},"requestContext":{"principal":{"name":os.environ["OPA_PRINCIPAL"],"principalType":"User"}}}}; req=urllib.request.Request("http://opa:8181/v1/data/kafka/authz/allow", data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}); print(urllib.request.urlopen(req, timeout=10).read().decode())'
 ```
 
 That returns `{"result":false}`. `pii_consumer` returns `{"result":true}`.
 
 ### Flink masking
 
-The job reads raw `credit-scores` and writes `credit-scores-sanitized`. For `analyst`, `ssn` is `***MASKED***` and `amount` is unchanged. `analyst` is allowed to read the sanitized topic because that topic is not tagged `pii`.
+The job reads raw `credit-scores` and writes `credit-scores-sanitized`. The credit-scores snapshot lists `ssn` as high and does not list `amount`, so both are `***MASKED***` for `analyst`. A field marked `low` would be left unchanged. `credit-scores-sanitized` is in the graph without a `pii` tag, so `analyst` can read it. An empty field snapshot masks every field.
 
 ```bash
 docker compose exec -T kafka \
@@ -140,10 +139,9 @@ docker compose exec -T neo4j cypher-shell -a bolt://localhost:7687 -u neo4j -p a
 Wait for a sync cycle, then confirm the projection and the decision:
 
 ```bash
-curl -s http://127.0.0.1:8181/v1/data/topics/credit-scores
-curl -s -X POST http://127.0.0.1:8181/v1/data/kafka/authz/allow \
-  -H 'content-type: application/json' \
-  -d '{"input":{"action":{"operation":"READ","resourcePattern":{"name":"credit-scores","resourceType":"TOPIC","patternType":"LITERAL"}},"requestContext":{"principal":{"name":"analyst","principalType":"User"}}}}'
+docker compose exec -T sync python -c 'import urllib.request; print(urllib.request.urlopen("http://opa:8181/v1/data/topics/credit-scores", timeout=10).read().decode())'
+docker compose exec -T -e OPA_PRINCIPAL=analyst -e OPA_TOPIC=credit-scores sync \
+  python -c 'import json,os,urllib.request; payload={"input":{"action":{"operation":"READ","resourcePattern":{"name":os.environ["OPA_TOPIC"],"resourceType":"TOPIC","patternType":"LITERAL"}},"requestContext":{"principal":{"name":os.environ["OPA_PRINCIPAL"],"principalType":"User"}}}}; req=urllib.request.Request("http://opa:8181/v1/data/kafka/authz/allow", data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"}); print(urllib.request.urlopen(req, timeout=10).read().decode())'
 ```
 
 `tags` no longer contains `pii`, and the decision is `{"result":true}`.

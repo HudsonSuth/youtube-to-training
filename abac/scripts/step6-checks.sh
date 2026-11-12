@@ -55,20 +55,29 @@ consume() {
     2>&1 || true
 }
 
+opa_get() {
+  docker compose exec -T -e OPA_PATH="$1" sync \
+    python -c 'import os,urllib.request; print(urllib.request.urlopen("http://opa:8181"+os.environ["OPA_PATH"], timeout=10).read().decode(), end="")'
+}
+
 opa_allow() {
-  local principal="$1"
-  local topic="$2"
-  curl -sf -X POST "http://127.0.0.1:8181/v1/data/kafka/authz/allow" \
-    -H 'content-type: application/json' \
-    -d "{\"input\":{\"action\":{\"operation\":\"READ\",\"resourcePattern\":{\"name\":\"${topic}\",\"resourceType\":\"TOPIC\",\"patternType\":\"LITERAL\"}},\"requestContext\":{\"principal\":{\"name\":\"${principal}\",\"principalType\":\"User\"}}}}"
+  docker compose exec -T \
+    -e OPA_PRINCIPAL="$1" \
+    -e OPA_TOPIC="$2" \
+    -e OPA_OPERATION="${3:-READ}" \
+    sync python -c 'import json,os,urllib.request
+payload={"input":{"action":{"operation":os.environ["OPA_OPERATION"],"resourcePattern":{"name":os.environ["OPA_TOPIC"],"resourceType":"TOPIC","patternType":"LITERAL"}},"requestContext":{"principal":{"name":os.environ["OPA_PRINCIPAL"],"principalType":"User"}}}}
+req=urllib.request.Request("http://opa:8181/v1/data/kafka/authz/allow", data=json.dumps(payload).encode(), headers={"Content-Type":"application/json"})
+print(urllib.request.urlopen(req, timeout=10).read().decode(), end="")'
 }
 
 echo "1. Restore the pii tag and wait until the sync publishes both principals"
+cypher "MERGE (t:Topic {name: 'credit-scores-sanitized'}) SET t.region = 'us', t.classification = 1"
 cypher "MATCH (t:Topic {name: 'credit-scores'}) MATCH (pii:Tag {name: 'pii'}) MERGE (t)-[:HAS_TAG]->(pii)"
 wait_healthy sync
 for ((i = 1; i <= 20; i++)); do
-  data="$(curl -sf http://127.0.0.1:8181/v1/data)"
-  if python3 -c 'import json,sys; doc=json.loads(sys.argv[1])["result"]; tags=doc["topics"]["credit-scores"]["tags"]; principals=doc["principals"]; raise SystemExit(0 if "pii" in tags and {"analyst","pii_consumer"} <= set(principals) else 1)' "$data"; then
+  data="$(opa_get /v1/data)"
+  if python3 -c 'import json,sys; doc=json.loads(sys.argv[1])["result"]; tags=doc["topics"]["credit-scores"]["tags"]; principals=doc["principals"]; raise SystemExit(0 if "pii" in tags and "credit-scores-sanitized" in doc["topics"] and {"analyst","pii_consumer"} <= set(principals) else 1)' "$data"; then
     break
   fi
   if [[ "$i" -eq 20 ]]; then
@@ -80,16 +89,37 @@ for ((i = 1; i <= 20; i++)); do
 done
 echo "   projection ready"
 
+sanitized_end_offset() {
+  local line
+  line="$(docker compose exec -T kafka /opt/kafka/bin/kafka-get-offsets.sh \
+    --bootstrap-server kafka:9092 \
+    --topic credit-scores-sanitized \
+    --command-config /mnt/shared/config/client-kafka.properties 2>/dev/null || true)"
+  python3 -c 'import sys
+text=sys.argv[1].strip().splitlines()
+offsets=[int(row.split(":")[-1]) for row in text if row.count(":") >= 2 and row.split(":")[-1].lstrip("-").isdigit()]
+print(max(offsets) if offsets else 0)' "$line"
+}
+
 echo "2. Produce a credit-scores record as pii_consumer"
+before_sanitized="$(sanitized_end_offset)"
 produce
 echo "   produced ${PAYLOAD}"
 
 echo "3. OPA denies analyst and allows pii_consumer on the PII topic"
 analyst_decision="$(opa_allow analyst credit-scores)"
 consumer_decision="$(opa_allow pii_consumer credit-scores)"
-python3 -c 'import json,sys; assert json.loads(sys.argv[1])["result"] is False' "$analyst_decision"
-python3 -c 'import json,sys; assert json.loads(sys.argv[2])["result"] is True' "$analyst_decision" "$consumer_decision"
-echo "   analyst=${analyst_decision} pii_consumer=${consumer_decision}"
+missing_principal="$(opa_allow nobody credit-scores)"
+missing_topic="$(opa_allow analyst missing-topic)"
+write_decision="$(opa_allow analyst credit-scores WRITE)"
+python3 -c 'import json,sys
+assert json.loads(sys.argv[1])["result"] is False
+assert json.loads(sys.argv[2])["result"] is True
+assert json.loads(sys.argv[3])["result"] is False
+assert json.loads(sys.argv[4])["result"] is False
+assert json.loads(sys.argv[5])["result"] is True' \
+  "$analyst_decision" "$consumer_decision" "$missing_principal" "$missing_topic" "$write_decision"
+echo "   analyst=${analyst_decision} pii_consumer=${consumer_decision} missing_principal=${missing_principal} missing_topic=${missing_topic} write=${write_decision}"
 
 echo "4. Broker denies the low-clearance analyst read"
 denied="$(consume client-analyst.properties credit-scores 15000 1)"
@@ -114,27 +144,37 @@ if [[ "$raw" != *"$TOKEN"* ]]; then
 fi
 echo "   pii_consumer saw the raw ssn"
 
-echo "6. Flink masks the high-sensitivity field for analyst"
+echo "6. Flink masks high and unknown fields for analyst"
 masked=""
 for ((i = 1; i <= 24; i++)); do
-  masked="$(consume client-analyst.properties credit-scores-sanitized 8000 20)"
-  if [[ "$masked" == *"***MASKED***"* && "$masked" == *"4200"* && "$masked" != *"$TOKEN"* ]]; then
-    break
+  now="$(sanitized_end_offset)"
+  if [[ "$now" -gt "$before_sanitized" ]]; then
+    masked="$(docker compose exec -T kafka /opt/kafka/bin/kafka-console-consumer.sh \
+      --bootstrap-server kafka:9092 \
+      --topic credit-scores-sanitized \
+      --partition 0 \
+      --offset "$before_sanitized" \
+      --timeout-ms 8000 \
+      --max-messages 1 \
+      --consumer.config /mnt/shared/config/client-analyst.properties 2>&1 || true)"
+    if [[ "$masked" == *"***MASKED***"* && "$masked" != *"$TOKEN"* && "$masked" != *"4200"* ]]; then
+      break
+    fi
   fi
   if [[ "$i" -eq 24 ]]; then
-    echo "sanitized topic did not contain a masked record" >&2
+    echo "sanitized topic did not mask the new record" >&2
     echo "$masked" >&2
     docker compose logs --tail 80 flink >&2 || true
     exit 1
   fi
   sleep 5
 done
-echo "   sanitized record masks ssn and keeps amount"
+echo "   sanitized record masks ssn and the unknown amount"
 
 echo "7. Remove the pii tag and wait for the next sync"
 cypher "MATCH (t:Topic {name: 'credit-scores'})-[r:HAS_TAG]->(:Tag {name: 'pii'}) DELETE r"
 for ((i = 1; i <= 20; i++)); do
-  data="$(curl -sf http://127.0.0.1:8181/v1/data/topics/credit-scores)"
+  data="$(opa_get /v1/data/topics/credit-scores)"
   decision="$(opa_allow analyst credit-scores)"
   if python3 -c 'import json,sys; tags=json.loads(sys.argv[1]).get("result",{}).get("tags",[]); decision=json.loads(sys.argv[2]); raise SystemExit(0 if "pii" not in tags and decision.get("result") is True else 1)' "$data" "$decision"; then
     echo "   OPA now allows analyst: ${decision}"

@@ -50,8 +50,6 @@ services:
       - /policies/kafka.authz.rego
     volumes:
       - ./policies/kafka.authz.rego:/policies/kafka.authz.rego:ro
-    ports:
-      - "8181:8181"
 
   sync:
     build: ./sync

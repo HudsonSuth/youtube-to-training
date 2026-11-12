@@ -4,22 +4,32 @@ import rego.v1
 
 default allow := false
 
+# WRITE and other non-topic operations stay allowed so producers work.
+# Topic reads are not covered here, so a missing deny cannot turn into an allow.
 allow if {
-    not deny
+    not is_topic_read
 }
 
-# Example: deny reads of PII-tagged topics unless clearance is sufficient
-deny if {
-    is_read_operation
-    topic := input.action.resourcePattern.name
-    topic_meta := data.topics[topic]
+# A topic read is allowed only when the topic, the principal, and a numeric
+# clearance are all present, and the PII rule does not deny it.
+allow if {
+    is_topic_read
+    topic_meta := data.topics[topic_name]
+    principal := data.principals[principal_name]
+    clearance := principal.clearance
+    is_number(clearance)
+    not pii_read_denied(topic_meta, clearance)
+}
+
+pii_read_denied(topic_meta, clearance) if {
     "pii" in topic_meta.tags
-    principal_clearance < topic_meta.classification
+    clearance < topic_meta.classification
 }
 
-is_read_operation if {
+is_topic_read if {
     input.action.operation == "READ"
+    input.action.resourcePattern.resourceType == "TOPIC"
 }
 
-principal_clearance := data.principals[principal_name].clearance
+topic_name := input.action.resourcePattern.name
 principal_name := input.requestContext.principal.name
